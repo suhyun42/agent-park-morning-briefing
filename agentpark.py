@@ -217,86 +217,100 @@ def get_weather_summary():
 
 # -------- CALENDAR --------
 def get_today_calendar_events():
-    # token_calendar.pkl should live inside SECRET_DIR
-    creds = get_credentials(CAL_SCOPES, "token_calendar.pkl")
-    service = build("calendar", "v3", credentials=creds)
+    try:
+        # token_calendar.pkl should live inside SECRET_DIR
+        creds = get_credentials(CAL_SCOPES, "token_calendar.pkl")
+        service = build("calendar", "v3", credentials=creds)
 
-    now = datetime.utcnow()
-    end = now + timedelta(days=1)
+        now = datetime.utcnow()
+        end = now + timedelta(days=1)
 
-    now_iso = now.isoformat() + "Z"
-    end_iso = end.isoformat() + "Z"
+        now_iso = now.isoformat() + "Z"
+        end_iso = end.isoformat() + "Z"
 
-    events_result = (
-        service.events()
-        .list(
-            calendarId="primary",
-            timeMin=now_iso,
-            timeMax=end_iso,
-            singleEvents=True,
-            orderBy="startTime",
+        events_result = (
+            service.events()
+            .list(
+                calendarId="primary",
+                timeMin=now_iso,
+                timeMax=end_iso,
+                singleEvents=True,
+                orderBy="startTime",
+            )
+            .execute()
         )
-        .execute()
-    )
-    events = events_result.get("items", [])
+        events = events_result.get("items", [])
 
-    summaries = []
-    for e in events:
-        start_raw = e["start"].get("dateTime", e["start"].get("date"))
-        # Try to display start time nicely
-        try:
-            dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
-            start_str = dt.strftime("%I:%M %p").lstrip("0")
-        except Exception:
-            start_str = start_raw
+        summaries = []
+        for e in events:
+            start_raw = e["start"].get("dateTime", e["start"].get("date"))
+            # Try to display start time nicely
+            try:
+                dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+                start_str = dt.strftime("%I:%M %p").lstrip("0")
+            except Exception:
+                start_str = start_raw
 
-        title = e.get("summary", "(no title)")
-        summaries.append(f"{start_str}: {title}")
+            title = e.get("summary", "(no title)")
+            summaries.append(f"{start_str}: {title}")
 
-    return summaries
+        return summaries
+
+    except Exception as e:
+        # On Render (or if misconfigured), just log and return no events
+        print("Calendar error:", e)
+        return []
+
 
 
 # -------- GMAIL: PACKAGE EMAILS --------
 def get_recent_package_emails():
-    # token_gmail.pkl should live inside SECRET_DIR
-    creds = get_credentials(GMAIL_SCOPES, "token_gmail.pkl")
-    service = build("gmail", "v1", credentials=creds)
+    try:
+        # token_gmail.pkl should live inside SECRET_DIR
+        creds = get_credentials(GMAIL_SCOPES, "token_gmail.pkl")
+        service = build("gmail", "v1", credentials=creds)
 
-    # Look at last 7 days for shipping language
-    query = 'newer_than:7d ("your order has shipped" OR "out for delivery" OR "order update")'
-    results = (
-        service.users()
-        .messages()
-        .list(userId="me", q=query, maxResults=10)
-        .execute()
-    )
-    messages = results.get("messages", [])
-
-    if not messages:
-        return []
-
-    package_summaries = []
-
-    for m in messages:
-        msg = (
+        # Look at last 7 days for shipping language
+        query = 'newer_than:7d ("your order has shipped" OR "out for delivery" OR "order update")'
+        results = (
             service.users()
             .messages()
-            .get(
-                userId="me",
-                id=m["id"],
-                format="metadata",
-                metadataHeaders=["Subject", "From"],
-            )
+            .list(userId="me", q=query, maxResults=10)
             .execute()
         )
-        headers = {
-            h["name"]: h["value"] for h in msg["payload"].get("headers", [])
-        }
-        subject = headers.get("Subject", "(no subject)")
-        sender = headers.get("From", "(unknown sender)")
-        package_summaries.append(f"{subject} from {sender}")
+        messages = results.get("messages", [])
 
-    return package_summaries
+        if not messages:
+            return []
+
+        package_summaries = []
+
+        for m in messages:
+            msg = (
+                service.users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=m["id"],
+                    format="metadata",
+                    metadataHeaders=["Subject", "From"],
+                )
+                .execute()
+            )
+            headers = {
+                h["name"]: h["value"] for h in msg["payload"].get("headers", [])
+            }
+            subject = headers.get("Subject", "(no subject)")
+            sender = headers.get("From", "(unknown sender)")
+            package_summaries.append(f"{subject} from {sender}")
+
+        return package_summaries
+
+    except Exception as e:
+        # On Render (or if misconfigured), just log and return no packages
+        print("Gmail error:", e)
+        return []
+
 
 
 # -------- BUILD MORNING SUMMARY --------
