@@ -1,251 +1,202 @@
 import os
 from datetime import datetime, timedelta
+from pathlib import Path
+import pickle
 
 import requests
 from dotenv import load_dotenv
+from openai import OpenAI
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
-import pickle
+
+
+
+# ---------------- ENV + CONFIG ----------------
 
 # Load environment variables from .env
 load_dotenv()
 
+# API keys and config from .env
 NYT_KEY = os.getenv("NYT_API_KEY")
 WEATHER_KEY = os.getenv("WEATHER_API_KEY")
 LAT = os.getenv("HOME_LAT")
 LON = os.getenv("HOME_LON")
+OPENAI_API_KEY = os.getenv ("OpenAI_API_KEY")
+
+
+# Folder where credentials.json and token_*.pkl live
+SECRET_DIR = Path(os.getenv("AGENTPARK_SECRET_DIR", "")).expanduser()
+credentials_path = SECRET_DIR /  "credentials.json"
+
 
 # Google API scopes
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 CAL_SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-def get_credentials(scopes, token_filename):
+
+def get_credentials(scopes, token_filename: str):
     """
     Handles Google OAuth flow for either Gmail or Calendar.
-    Saves token to token_filename so you only log in once.
+    Saves token to token_filename inside SECRET_DIR so you only log in once.
     """
+    if not SECRET_DIR:
+        raise RuntimeError(
+            "AGENTPARK_SECRET_DIR is not set. Add it to your .env file."
+        )
+
+    # Debug helpers – you can remove these once things work
+    print("SECRET_DIR is:", SECRET_DIR)
+
+    # Build full path to the token file in the secrets folder
+    token_path = SECRET_DIR / token_filename
+    print("Using token file:", token_path, "Exists:", token_path.exists())
+
     creds = None
-    if os.path.exists(token_filename):
-        with open(token_filename, "rb") as token:
-            creds = pickle.load(token)
+    if token_path.exists():
+        with open(token_path, "rb") as token_file:
+            creds = pickle.load(token_file)
 
     # If there are no (valid) credentials, let user log in via browser
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
+            credentials_path = SECRET_DIR / "credentials.json"
+            print(
+                "Using credentials file:",
+                credentials_path,
+                "Exists:",
+                credentials_path.exists(),
+            )
+
             flow = InstalledAppFlow.from_client_secrets_file(
-                "credentials.json", scopes
+                str(credentials_path), scopes
             )
             creds = flow.run_local_server(port=0)
 
-        with open(token_filename, "wb") as token:
-            pickle.dump(creds, token)
+        # Save the refreshed/new token back into the secrets folder
+        with open(token_path, "wb") as token_file:
+            pickle.dump(creds, token_file)
 
     return creds
 
 
 # -------- NYT NEWS --------
+# Create OpenAI client (will be None if key missing)
 
-def get_top_news(limit=None):
+def _expand_summary_with_gpt(title, abstract, url=None, target_sentences=7):
     """
-    Fetches top global/political and technology news from NYT.
-
-    Returns a dict:
-    {
-        "global_politics": [
-            {"ordinal": "first", "title": "...", "summary": "..."},
-            ...
-        ],
-        "technology": [
-            {"ordinal": "first", "title": "...", "summary": "..."},
-            ...
-        ]
-    }
-
-    `limit` is kept for backward compatibility but is not used. The function
-    returns 2–3 global/political stories and 3–4 technology stories.
+    Use GPT to turn a short NYT abstract into a longer, 5–10 sentence overview.
+    If anything goes wrong, just return the original abstract.
     """
-    ORDINAL_WORDS = ["first", "second", "third", "fourth", "fifth"]
+    if not client or not abstract:
+        return abstract or "No summary available."
 
-    def _fetch_nyt_section(section, api_key, max_items):
-        """
-        Helper to fetch a section from NYT Top Stories.
-        """
-        url = f"https://api.nytimes.com/svc/topstories/v2/{section}.json"
-        resp = requests.get(url, params={"api-key": api_key}, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("results", [])[:max_items]
+    prompt = f"""
+You are preparing a spoken news briefing.
 
-    def _build_rich_summary(story):
-        """
-        Turn NYT fields into a richer multi-sentence summary.
-        """
-        abstract = (story.get("abstract") or "").strip()
-        if not abstract:
-            abstract = (story.get("snippet") or "").strip()
+New York Times story:
+Title: {title}
+Short abstract: {abstract}
+URL (may or may not be accessible): {url or "N/A"}
 
-        section = (story.get("section") or "").strip()
-        subsection = (story.get("subsection") or "").strip()
-        byline = (story.get("byline") or "").strip()
-        geo = story.get("geo_facet") or []
-        des = story.get("des_facet") or []
-
-        extra_sentences = []
-
-        if section:
-            if subsection:
-                extra_sentences.append(
-                    f"This story appears in the {section} – {subsection} section of the New York Times."
-                )
-            else:
-                extra_sentences.append(
-                    f"This story appears in the {section} section of the New York Times."
-                )
-
-        if geo:
-            extra_sentences.append(
-                f"It is particularly focused on {', '.join(geo[:2])}."
-            )
-
-        if des:
-            extra_sentences.append(
-                f"Key themes include {', '.join(des[:3])}."
-            )
-
-        if byline:
-            extra_sentences.append(byline)
-
-        if not abstract and not extra_sentences:
-            return "No summary available."
-
-        return " ".join([abstract] + extra_sentences)
-
-    # --- If no API key, return a helpful message ---
-    if not NYT_KEY:
-        msg = "Add NYT_API_KEY in your .env file to enable news."
-        fallback = [{
-            "ordinal": "first",
-            "title": "(NYT API key missing)",
-            "summary": msg
-        }]
-        return {
-            "global_politics": fallback,
-            "technology": fallback,
-        }
+Write a clear, factual, {target_sentences}-sentence overview suitable
+for a ~2-minute spoken summary. Requirements:
+- Be concise but informative.
+- Do NOT mention this is an 'abstract' or 'article' or 'URL'.
+- Focus on what happened, why it matters, and key context.
+- Avoid speculation and made-up details; stay grounded in the abstract.
+"""
 
     try:
-        # ---------- Global / Political (2–3 items) ----------
-        world_stories = _fetch_nyt_section("world", NYT_KEY, max_items=8)
-        politics_stories = _fetch_nyt_section("politics", NYT_KEY, max_items=8)
-        global_candidates = world_stories + politics_stories
+        resp = client.responses.create(
+            model="gpt-4.1-mini",
+            input=prompt,
+            max_output_tokens=500,
+        )
+        # Extract text from the response; adjust if your OpenAI client shape differs
+        long_text = resp.output[0].content[0].text.strip()
+        return long_text or abstract
+    except Exception:
+        # On any error, fall back to the original abstract
+        return abstract
 
-        # Sort by published_date desc if present
-        global_candidates.sort(
-            key=lambda s: s.get("published_date", ""),
-            reverse=True,
+
+def get_top_news(limit=5, detailed=False, target_sentences=7):
+    """
+    Returns a list of dicts like:
+    [
+        {"title": "...", "summary": "..."},
+        ...
+    ]
+
+    If detailed=True, 'summary' will be expanded into a 5–10 sentence overview
+    using GPT (approx. 2-minute spoken summary).
+    """
+    if not NYT_KEY:
+        return [
+            {
+                "title": "(NYT API key missing)",
+                "summary": "Add NYT_API_KEY in your .env file to enable news.",
+            }
+        ]
+
+    url = "https://api.nytimes.com/svc/topstories/v2/home.json"
+    resp = requests.get(url, params={"api-key": NYT_KEY})
+    resp.raise_for_status()
+    data = resp.json()
+
+    stories = data.get("results", [])[:limit]
+    items = []
+
+    for s in stories:
+        title = (s.get("title") or "").strip()
+        abstract = (s.get("abstract") or "").strip()
+
+        # Fallback if abstract is empty
+        if not abstract:
+            abstract = (s.get("snippet") or "").strip()
+
+        story_url = s.get("url")  # might be useful later
+
+        if not title:
+            continue
+
+        summary = abstract if abstract else "No summary available."
+
+        if detailed:
+            summary = _expand_summary_with_gpt(
+                title=title,
+                abstract=summary,
+                url=story_url,
+                target_sentences=target_sentences,
+            )
+
+        items.append(
+            {
+                "title": title,
+                "summary": summary,
+                # optional: include URL in case you want to link it in the voice/text
+                "url": story_url,
+            }
         )
 
-        global_politics_items = []
-        seen_titles = set()
-
-        for s in global_candidates:
-            title = (s.get("title") or "").strip()
-            if not title or title in seen_titles:
-                continue
-
-            seen_titles.add(title)
-            summary = _build_rich_summary(s)
-
-            idx = len(global_politics_items)
-            ordinal = ORDINAL_WORDS[idx] if idx < len(ORDINAL_WORDS) else f"{idx + 1}th"
-
-            global_politics_items.append(
-                {
-                    "ordinal": ordinal,
-                    "title": title,
-                    "summary": summary,
-                }
-            )
-
-            if len(global_politics_items) >= 3:  # 2–3 global/political stories
-                break
-
-        # ---------- Technology (3–4 items) ----------
-        tech_stories = _fetch_nyt_section("technology", NYT_KEY, max_items=10)
-        tech_items = []
-        seen_titles = set()
-
-        for s in tech_stories:
-            title = (s.get("title") or "").strip()
-            if not title or title in seen_titles:
-                continue
-
-            seen_titles.add(title)
-            summary = _build_rich_summary(s)
-
-            idx = len(tech_items)
-            ordinal = ORDINAL_WORDS[idx] if idx < len(ORDINAL_WORDS) else f"{idx + 1}th"
-
-            tech_items.append(
-                {
-                    "ordinal": ordinal,
-                    "title": title,
-                    "summary": summary,
-                }
-            )
-
-            if len(tech_items) >= 4:  # 3–4 tech stories
-                break
-
-        # Fallbacks if lists ended up empty
-        if not global_politics_items:
-            global_politics_items.append(
-                {
-                    "ordinal": "first",
-                    "title": "No global or political stories available.",
-                    "summary": "The New York Times API did not return any global or political stories at this time.",
-                }
-            )
-
-        if not tech_items:
-            tech_items.append(
-                {
-                    "ordinal": "first",
-                    "title": "No technology stories available.",
-                    "summary": "The New York Times API did not return any technology stories at this time.",
-                }
-            )
-
-        return {
-            "global_politics": global_politics_items,
-            "technology": tech_items,
-        }
-
-    except Exception as e:
-        err = f"Error fetching NYT news: {e}"
-        fallback = [{
-            "ordinal": "first",
-            "title": "News unavailable",
-            "summary": err
-        }]
-        return {
-            "global_politics": fallback,
-            "technology": fallback,
-        }
-
-
+    return items
 
 # -------- WEATHER --------
 def get_weather_summary():
     if not WEATHER_KEY:
         return "(Weather API key missing – add WEATHER_API_KEY in .env)"
 
-    url = "https://api.openweathermap.org/data/2.5/weather?lat=37.7749&lon=-122.4194&appid=cf2ec116811073a689499aec6848f2b5"
+    if not LAT or not LON:
+        return "(Location missing – add HOME_LAT and HOME_LON in .env)"
+
+    # Base URL only; all parameters go in 'params'
+    url = "https://api.openweathermap.org/data/2.5/weather"
     params = {
         "lat": LAT,
         "lon": LON,
@@ -266,6 +217,7 @@ def get_weather_summary():
 
 # -------- CALENDAR --------
 def get_today_calendar_events():
+    # token_calendar.pkl should live inside SECRET_DIR
     creds = get_credentials(CAL_SCOPES, "token_calendar.pkl")
     service = build("calendar", "v3", credentials=creds)
 
@@ -306,6 +258,7 @@ def get_today_calendar_events():
 
 # -------- GMAIL: PACKAGE EMAILS --------
 def get_recent_package_emails():
+    # token_gmail.pkl should live inside SECRET_DIR
     creds = get_credentials(GMAIL_SCOPES, "token_gmail.pkl")
     service = build("gmail", "v1", credentials=creds)
 
@@ -352,12 +305,10 @@ def build_morning_summary():
 
     # Get data
     weather = get_weather_summary()
-    news = get_top_news()  # updated: no limit argument, returns dict
+    # Ask for longer, ~2-minute style summaries
+    headlines = get_top_news(limit=7, detailed=True, target_sentences=8)
     events = get_today_calendar_events()
     packages = get_recent_package_emails()
-
-    global_news = (news or {}).get("global_politics", [])
-    tech_news = (news or {}).get("technology", [])
 
     parts = []
     parts.append(f"Alrighty, here’s your rundown for {today_str}.")
@@ -366,35 +317,19 @@ def build_morning_summary():
     parts.append(f"\nWeather: {weather}.")
 
     # News
-    if global_news or tech_news:
-        parts.append("\nHere are today's trending stories:")
+    if headlines:
+        parts.append("\nHere are some top news stories you should know about:")
 
-    # Global / political updates
-    if global_news:
-        parts.append("\nFirst, let’s ramp you up on the global and political updates.")
-        for item in global_news:
-            ordinal = item.get("ordinal", "").strip() or "first"
-            title = (item.get("title") or "").strip()
-            summary = (item.get("summary") or "").strip()
+    for item in headlines:
+        title = (item.get("title") or "").strip()
+        summary = (item.get("summary") or "").strip()
 
-            # Spoken-style phrasing: first, second, third...
-            if title:
-                parts.append(f"The {ordinal} global update is: {title}.")
-            if summary:
-                parts.append(summary)
-
-    # Technology updates
-    if tech_news:
-        parts.append("\nNow, here's the latest within the tech industry.")
-        for item in tech_news:
-            ordinal = item.get("ordinal", "").strip() or "first"
-            title = (item.get("title") or "").strip()
-            summary = (item.get("summary") or "").strip()
-
-            if title:
-                parts.append(f"The {ordinal} tech trend is: {title}.")
-            if summary:
-                parts.append(summary)
+        # Bullet with title
+        if title:
+            parts.append(f"\n• {title}")
+        # Indented multi-sentence overview under it
+        if summary:
+            parts.append(f"  {summary}")
 
     # Calendar
     if events:
@@ -410,7 +345,9 @@ def build_morning_summary():
         for p in packages:
             parts.append(f"• {p}")
     else:
-        parts.append("\nYou don't have any delivery updates you need to worry about right now.")
+        parts.append(
+            "\nYou don't have any new delivery updates you need to worry about right now."
+        )
 
     return "\n".join(parts)
 
